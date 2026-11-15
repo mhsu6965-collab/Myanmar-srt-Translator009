@@ -1,237 +1,213 @@
-import os
-import re
-import numpy as np
-import soundfile as sf
 import streamlit as st
-from gradio_client import Client, handle_file
+import pysrt
+from google import genai
+import tempfile
+import os
 
-st.set_page_config(page_title="Myanmar Voice Clone 24/7", page_icon="🎙️", layout="wide")
-
-st.title("🎙️ Myanmar Voice Clone App (24/7 Free Public GPU)")
-st.caption("Card ချိတ်ရန်မလို · Colab ဖွင့်ရန်မလို · Public ZeroGPU Server များနှင့် တိုက်ရိုက်ချိတ်ဆက်ထားသည်")
-
-# လက်ရှိ Hugging Face ပေါ်တွင် ZeroGPU ဖြင့် အခမဲ့ Run နေသော Myanmar VoxCPM2 Public Spaces များ
-PUBLIC_SERVERS = [
-    "hub10/voxcpm2-myanmar-clone-test",
-    "Hub11x/voxcpm2-myanmar-clone-test",
-    "hub6x/voxcpm2-myanmar-clone-test",
-    "NayWin27/voxcpm2-clone-space",
-    "openbmb/VoxCPM-Demo"
-]
-
-st.sidebar.header("🌐 Public GPU Server ရွေးချယ်ရန်")
-selected_server = st.sidebar.selectbox(
-    "Server တစ်ခု လူပြည့်နေပါက အခြားတစ်ခု ပြောင်းသုံးနိုင်သည် -",
-    PUBLIC_SERVERS,
-    index=0
-)
-custom_server = st.sidebar.text_input("သို့မဟုတ် အခြား Hugging Face Space အမည်ထည့်ရန် (Optional)", "")
-active_space = custom_server.strip() if custom_server.strip() else selected_server
-
-hf_token = st.sidebar.text_input(
-    "🔑 HF Token (Optional - Free Quota ပိုရစေရန်)",
-    type="password",
-    help="Card မလိုသော ရိုးရိုး Hugging Face အကောင့်၏ Read Token ထည့်ပေးပါက ZeroGPU အချိန်ပိုရပါမည်။"
+# Page Configuration
+st.set_page_config(
+    page_title="SRT Clipper & MM Translator",
+    page_icon="🎬",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-def prepare_ref_audio(uploaded_file, max_sec=12.0):
-    temp_in = "temp_uploaded_ref.wav"
-    with open(temp_in, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    data, sr = sf.read(temp_in)
-    if data.ndim > 1:
-        data = np.mean(data, axis=1)
-    max_samples = int(max_sec * sr)
-    if len(data) > max_samples:
-        data = data[:max_samples]
-    clean_path = "cleaned_ref_audio.wav"
-    sf.write(clean_path, data, sr)
-    return clean_path
+# Custom CSS for Modern UI
+st.markdown("""
+<style>
+    .main-header {
+        background: linear-gradient(90deg, #FF4B4B 0%, #FF8F00 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        font-size: 2.5rem;
+        font-weight: 800;
+        margin-bottom: 0.2rem;
+    }
+    .sub-header {
+        color: #888888;
+        font-size: 1.05rem;
+        margin-bottom: 1.5rem;
+    }
+    .stButton>button {
+        background: linear-gradient(90deg, #FF4B4B 0%, #FF7600 100%);
+        color: white;
+        border: none;
+        border-radius: 10px;
+        padding: 0.6rem 1.2rem;
+        font-weight: 600;
+        width: 100%;
+        transition: 0.3s;
+    }
+    .stButton>button:hover {
+        opacity: 0.9;
+        transform: translateY(-1px);
+    }
+    div[data-testid="stMetricValue"] {
+        font-size: 1.4rem;
+        color: #FF4B4B;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-def split_myanmar_sentences(text, max_chars=180):
-    raw_parts = re.split(r'(?<=[။!?])\s*|\n+', text.strip())
-    chunks, current = [], ""
-    for part in raw_parts:
-        part = part.strip()
-        if not part:
-            continue
-        if len(current) + len(part) + 1 <= max_chars:
-            current = f"{current} {part}".strip() if current else part
-        else:
-            if current:
-                chunks.append(current)
-            current = part
-    if current:
-        chunks.append(current)
-    return chunks if chunks else [text.strip()]
+# Sidebar - Settings & API Key
+with st.sidebar:
+    st.markdown("### ⚙️ Settings & API")
+    
+    # Environment သို့မဟုတ် Streamlit Secrets မှ Key ကို အရင်ရှာမည်
+    env_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", None)
+    
+    if env_key:
+        st.success("✅ API Key ချိတ်ဆက်ပြီးပါပြီ (Secrets)")
+        api_key = env_key
+    else:
+        api_key = st.text_input("🔑 Gemini API Key ထည့်ပါ", type="password", help="Google AI Studio မှ ရသော Key ကို ထည့်ပါ")
+        st.caption("[👉 အခမဲ့ API Key ယူရန် နှိပ်ပါ](https://aistudio.google.com/)")
 
-def extract_audio_path(res):
-    if isinstance(res, str) and os.path.exists(res):
-        return res
-    if isinstance(res, dict) and "path" in res:
-        return res["path"]
-    if isinstance(res, (list, tuple)):
-        for item in res:
-            if isinstance(item, str) and os.path.exists(item):
-                return item
-            if isinstance(item, dict) and "path" in item:
-                return item["path"]
-    return None
-
-def call_public_voxcpm(client, api_info, chunk_text, ref_path, transcript, style_text, cfg, steps, max_steps, seed):
-    endpoints = api_info.get("named_endpoints", {})
-
-    # 1. Myanmar Clone Test Space ပုံစံအတိုင်း လှမ်းခေါ်ခြင်း
-    for ep_name, ep_data in endpoints.items():
-        params = ep_data.get("parameters", [])
-        param_names = [p.get("parameter_name", "").lower() for p in params]
-
-        # Long script endpoint မဟုတ်သော အဓိက Clone endpoint ကို ရှာခြင်း
-        if any("audio" in p or "ref" in p or "voice" in p for p in param_names) or len(params) >= 5:
-            kwargs = {}
-            for p in params:
-                pname = p.get("parameter_name")
-                plower = pname.lower()
-                ptype = str(p.get("python_type", {}).get("type", "")).lower()
-
-                if "audio" in plower or "ref" in plower and ("file" in ptype or "filepath" in ptype or "dict" in ptype):
-                    kwargs[pname] = handle_file(ref_path)
-                elif "transcript" in plower or "prompt_text" in plower:
-                    kwargs[pname] = transcript
-                elif "style" in plower or "instruct" in plower:
-                    kwargs[pname] = style_text
-                elif "text" in plower or "script" in plower:
-                    kwargs[pname] = chunk_text
-                elif "cfg" in plower:
-                    kwargs[pname] = float(cfg)
-                elif "max" in plower and "step" in plower:
-                    kwargs[pname] = int(max_steps)
-                elif "step" in plower or "timestep" in plower:
-                    kwargs[pname] = int(steps)
-                elif "seed" in plower and "bool" not in ptype:
-                    kwargs[pname] = int(seed)
-                elif p.get("parameter_has_default"):
-                    kwargs[pname] = p.get("parameter_default")
-
-            try:
-                res = client.predict(**kwargs, api_name=ep_name)
-                audio_out = extract_audio_path(res)
-                if audio_out:
-                    return audio_out
-            except Exception:
-                continue
-
-    # 2. Fallback: ပထမဆုံး Endpoint သို့ Positional Arguments ဖြင့် ပို့ခြင်း
-    first_ep = list(endpoints.keys())[0] if endpoints else 0
-    try:
-        res = client.predict(
-            chunk_text,
-            handle_file(ref_path),
-            transcript,
-            style_text,
-            float(cfg),
-            int(steps),
-            int(max_steps),
-            int(seed),
-            api_name=first_ep
-        )
-        return extract_audio_path(res)
-    except Exception as e:
-        raise RuntimeError(f"Server မှ တုံ့ပြန်မှု အမှားရှိနေပါသည်: {e}")
-
-col1, col2 = st.columns(2)
-
-with col1:
-    ref_file = st.file_uploader("1. Reference Audio (၅ မှ ၁၂ စက္ကန့်ခန့် နမူနာအသံဖိုင် တင်ရန်)", type=["wav", "mp3", "m4a", "flac"])
-    if ref_file:
-        st.audio(ref_file)
-
-    prompt_text = st.text_area(
-        "2. Exact Reference Transcript (နမူနာအသံဖိုင်ထဲက ပြောထားသော စာသားအတိအကျ - အသံပိုတူစေရန်)",
-        height=75,
-        placeholder="ဥပမာ - ခင်ဗျားတို့ဘဝမှာ ဘီယာတွေအဝသောက်ပြီး သေရလိမ့်မယ်လို့ တွေးမိကြဖူးသလား"
+    st.divider()
+    st.markdown("### 🎭 ဘာသာပြန် လေသံ (Tone)")
+    tone = st.selectbox(
+        "ဗီဒီယို အမျိုးအစား ရွေးပါ",
+        [
+            "Storytelling / Movie Recap (ဇာတ်လမ်းပြောပုံစံ)",
+            "Natural Spoken (သဘာဝ စကားပြောပုံစံ)",
+            "Educational / Explainer (ဗဟုသုတ ရှင်းပြပုံစံ)"
+        ]
     )
+    
+    batch_size = st.slider("Batch Size (တစ်ခါပြန်မည့် စာကြောင်းရေ)", 15, 50, 30)
+    st.divider()
+    st.info("💡 **CapCut Ready:** ဖြတ်လိုက်သော အပိုင်းကို CapCut ထဲ တန်းထည့်နိုင်ရန် အချိန်ကို `00:00:00,000` မှ အလိုအလျောက် ပြန်စပေးပါသည်။")
 
-    style_text = st.text_input(
-        "3. Optional Voice Style (အသံပုံစံ - မထည့်လည်းရသည်)",
-        placeholder="ဥပမာ - calm storytelling tone"
-    )
+# Main Content
+st.markdown('<div class="main-header">🎬 AI SRT Clipper & Myanmar Translator</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">SRT စာတန်းထိုးများကို လိုသလောက်ဖြတ်ထုတ်ပြီး သဘာဝကျသော မြန်မာစကားပြောပုံစံသို့ ပြောင်းလဲပါ</div>', unsafe_allow_html=True)
 
-    target_text = st.text_area(
-        "4. Text to Speak (အသစ်ထုတ်ပေးစေလိုသော မြန်မာစာပိုဒ် - အရှည်ကြီးထည့်နိုင်သည်)",
-        height=160,
-        placeholder="အသံပွားပြီး ပြောစေချင်သော မြန်မာစာသားများကို ဒီနေရာမှာ ရိုက်ထည့်ပါ..."
-    )
+uploaded_file = st.file_uploader("📂 SRT File ကို ဒီနေရာမှာ တင်ပါ (.srt)", type=["srt"])
 
-    c1, c2, c3 = st.columns(3)
-    cfg_val = c1.slider("CFG Scale", 1.0, 3.5, 2.0, 0.1)
-    steps_val = c2.slider("Inference Steps", 4, 20, 10, 1)
-    seed_val = c3.number_input("Seed", value=42, step=1)
-    max_audio_steps = 1024
+if uploaded_file is not None:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".srt") as tmp_file:
+        tmp_file.write(uploaded_file.getvalue())
+        tmp_path = tmp_file.name
 
-    gen_btn = st.button("🚀 Generate Myanmar Voice Clone", type="primary", use_container_width=True)
+    subs = pysrt.open(tmp_path, encoding='utf-8')
 
-with col2:
-    st.subheader("🎧 ထွက်ရှိလာသော အသံဖိုင် (48kHz)")
-    if gen_btn:
-        if not ref_file or not target_text.strip():
-            st.error("ကျေးဇူးပြု၍ Reference Audio နှင့် ထုတ်မည့် မြန်မာစာသားကို ထည့်သွင်းပေးပါ။")
-        else:
-            try:
-                with st.spinner(f"⏳ `{active_space}` Public GPU Server သို့ ချိတ်ဆက်နေပါသည်..."):
-                    clean_ref = prepare_ref_audio(ref_file, max_sec=12.0)
-                    chunks = split_myanmar_sentences(target_text, max_chars=170)
+    if len(subs) > 0:
+        min_time = str(subs[0].start).split(',')[0]
+        max_time = str(subs[-1].end).split(',')[0]
 
-                    client = Client(active_space, hf_token=hf_token.strip() if hf_token.strip() else None)
-                    api_info = client.view_api(return_format="dict")
+        # File Info Metrics
+        m1, m2, m3 = st.columns(3)
+        m1.metric("📄 စုစုပေါင်း စာကြောင်းရေ", f"{len(subs)} ကြောင်း")
+        m2.metric("⏱️ စတင်ချိန် (Start)", min_time)
+        m3.metric("🏁 ပြီးဆုံးချိန် (End)", max_time)
 
-                progress = st.progress(0, text="အသံစတင်ထုတ်ပေးနေပါသည်...")
-                all_wavs = []
-                out_sr = 48000
+        st.markdown("---")
+        st.subheader("✂️ ဖြတ်ထုတ်လိုသော အချိန်အပိုင်းအခြား ရွေးပါ")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            start_str = st.text_input("🟢 စတင်မည့်အချိန် (HH:MM:SS)", value=min_time)
+        with col2:
+            end_str = st.text_input("🔴 ပြီးဆုံးမည့်အချိန် (HH:MM:SS)", value=max_time)
 
-                for idx, chunk in enumerate(chunks):
-                    progress.progress((idx) / len(chunks), text=f"⏳ စာကြောင်း ({idx+1}/{len(chunks)}) ကို အသံထုတ်နေပါသည်...")
-                    part_path = call_public_voxcpm(
-                        client=client,
-                        api_info=api_info,
-                        chunk_text=chunk,
-                        ref_path=clean_ref,
-                        transcript=prompt_text.strip(),
-                        style_text=style_text.strip(),
-                        cfg=cfg_val,
-                        steps=steps_val,
-                        max_steps=max_audio_steps,
-                        seed=seed_val
-                    )
-                    if not part_path:
-                        raise RuntimeError("Server မှ အသံဖိုင် ပြန်မပို့ပေးပါ။ ဘေးဘက် Menu မှ အခြား Server တစ်ခု ပြောင်းစမ်းကြည့်ပါ။")
+        def parse_time(t_str):
+            parts = list(map(int, t_str.strip().split(':')))
+            return pysrt.SubRipTime(hours=parts[0], minutes=parts[1], seconds=parts[2])
 
-                    wav_data, sr = sf.read(part_path)
-                    if wav_data.ndim > 1:
-                        wav_data = np.mean(wav_data, axis=1)
-                    out_sr = sr
-                    all_wavs.append(wav_data.astype(np.float32))
-                    if idx < len(chunks) - 1:
-                        all_wavs.append(np.zeros(int(out_sr * 0.25), dtype=np.float32))
+        if st.button("🚀 ဖြတ်မယ် + မြန်မာဘာသာပြန်မယ်"):
+            if not api_key:
+                st.error("⚠️ ဘယ်ဘက်ခြမ်း Menu တွင် Gemini API Key အရင်ထည့်ပေးပါ (သို့မဟုတ်) Streamlit Secrets တွင် ထည့်သွင်းပါ။")
+            else:
+                try:
+                    start_time = parse_time(start_str)
+                    end_time = parse_time(end_str)
 
-                progress.progress(1.0, text="✅ အသံဖိုင်များအားလုံး ပေါင်းစည်းပြီးပါပြီ!")
-                final_wav = np.concatenate(all_wavs)
-                final_out_path = "final_myanmar_clone.wav"
-                sf.write(final_out_path, final_wav, out_sr)
+                    # Filter subtitles within time range
+                    clipped_subs = pysrt.SubRipFile([
+                        sub for sub in subs
+                        if sub.start >= start_time and sub.end <= end_time
+                    ])
 
-                st.success(f"✅ အောင်မြင်ပါသည်! စာကြောင်းရေ ({len(chunks)}) ပိုင်းခွဲ၍ အသံထုတ်ပြီးပါပြီ။")
-                st.audio(final_out_path)
-                with open(final_out_path, "rb") as f:
-                    st.download_button(
-                        "⬇️ Download Cloned Audio (.wav)",
-                        f,
-                        file_name="myanmar_voice_clone.wav",
-                        mime="audio/wav",
-                        use_container_width=True
-                    )
-            except Exception as e:
-                st.error(
-                    f"⚠️ လက်ရှိ Public Server (`{active_space}`) တွင် လူသုံးများနေပါသည် သို့မဟုတ် Quota ပြည့်နေပါသည်။\n\n"
-                    f"**ဖြေရှင်းနည်း:** ဘယ်ဘက်အပေါ်ထောင့် `>` ကိုနှိပ်ပြီး **Public GPU Server ရွေးချယ်ရန်** တွင် အခြား Server တစ်ခု ပြောင်းရွေးပါ။\n\n"
-                    f"အသေးစိတ်: `{e}`"
-                )
+                    if len(clipped_subs) == 0:
+                        st.warning("⚠️ ရွေးချယ်ထားသော အချိန်အတွင်း စာတန်းထိုး မရှိပါ။ အချိန်ပြန်စစ်ပေးပါ။")
+                    else:
+                        # Reset timecode to 00:00:00,000 based on start_time
+                        clipped_subs.shift(
+                            hours=-start_time.hours,
+                            minutes=-start_time.minutes,
+                            seconds=-start_time.seconds,
+                            milliseconds=-start_time.milliseconds
+                        )
+
+                        # Keep original text for comparison
+                        original_preview = "\n\n".join([f"{i+1}\n{s.start} --> {s.end}\n{s.text}" for i, s in enumerate(clipped_subs)])
+
+                        client = genai.Client(api_key=api_key)
+                        progress_bar = st.progress(0)
+                        status_box = st.empty()
+
+                        total_subs = len(clipped_subs)
+
+                        for i in range(0, total_subs, batch_size):
+                            batch = clipped_subs[i:i+batch_size]
+                            status_box.info(f"⏳ Gemini AI ဖြင့် ဘာသာပြန်နေပါသည်... ({min(i+batch_size, total_subs)} / {total_subs} ကြောင်း)")
+
+                            prompt_lines = [f"{idx}|||{sub.text.replace(chr(10), ' ')}" for idx, sub in enumerate(batch)]
+                            joined_text = "\n".join(prompt_lines)
+
+                            prompt = (
+                                f"Translate these subtitle lines into natural, engaging spoken Burmese suitable for short-form video narration (Style: {tone}). "
+                                "Ensure smooth Burmese phrasing. Keep the exact same 'index|||translated_text' format for every single line. "
+                                "Do not merge, skip, or add extra commentary.\n\n"
+                                f"{joined_text}"
+                            )
+
+                            response = client.models.generate_content(
+                                model="gemini-2.5-flash",
+                                contents=prompt
+                            )
+
+                            translated_lines = response.text.strip().split("\n")
+                            trans_dict = {}
+                            for line in translated_lines:
+                                if "|||" in line:
+                                    k, v = line.split("|||", 1)
+                                    if k.strip().isdigit():
+                                        trans_dict[int(k.strip())] = v.strip()
+
+                            for idx, sub in enumerate(batch):
+                                sub.index = i + idx + 1
+                                if idx in trans_dict:
+                                    sub.text = trans_dict[idx]
+
+                            progress_bar.progress(min((i + batch_size) / total_subs, 1.0))
+
+                        status_box.empty()
+                        out_path = tmp_path.replace(".srt", "_mm.srt")
+                        clipped_subs.save(out_path, encoding='utf-8')
+
+                        with open(out_path, "r", encoding="utf-8") as f:
+                            result_srt = f.read()
+
+                        st.success("🎉 ဖြတ်တောက်ပြီး မြန်မာဘာသာပြန်ဆိုမှု အောင်မြင်စွာ ပြီးဆုံးပါပြီ!")
+
+                        # Download Button
+                        st.download_button(
+                            label="📥 CapCut အသင့်သုံး မြန်မာ SRT ဒေါင်းလုဒ်ဆွဲရန်",
+                            data=result_srt,
+                            file_name=f"MM_{start_str.replace(':','')}_to_{end_str.replace(':','')}.srt",
+                            mime="text/plain"
+                        )
+
+                        # Side-by-Side Preview
+                        st.markdown("### 👀 နမူနာ နှိုင်းယှဉ်ကြည့်ရန် (Preview)")
+                        p_col1, p_col2 = st.columns(2)
+                        with p_col1:
+                            st.text_area("မူရင်း SRT (အချိန် Reset လုပ်ပြီး)", original_preview, height=320)
+                        with p_col2:
+                            st.text_area("မြန်မာဘာသာပြန် SRT (00:00:00 မှ စသည်)", result_srt, height=320)
+
+                except Exception as e:
+                    st.error(f"❌ အမှားတစ်ခု ဖြစ်ပွားနေပါသည်: {e}")
+
+    os.remove(tmp_path)
